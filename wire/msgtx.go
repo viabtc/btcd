@@ -100,7 +100,7 @@ const (
 	// item: 1 byte for length + 1 byte for the witness item itself, or two
 	// bytes. This value is then divided by the currently allowed maximum
 	// "cost" for a transaction.
-	maxWitnessItemsPerInput = 500000
+	maxWitnessItemsPerInput = 4000000
 
 	// maxWitnessItemSize is the maximum allowed size for an item within
 	// an input's witness data. This number is derived from the fact that
