@@ -341,6 +341,10 @@ const (
 	// numErrorCodes is the maximum error code number used in tests.  This
 	// entry MUST be the last entry in the enum.
 	numErrorCodes
+
+	// ErrUnsupportedScriptVersion is returned when an unsupported script
+	// version is passed to a function which deals with script analysis.
+	ErrUnsupportedScriptVersion
 )
 
 // Map of ErrorCode values back to their constant names for pretty printing.
@@ -409,6 +413,7 @@ var errorCodeStrings = map[ErrorCode]string{
 	ErrMinimalIf:                          "ErrMinimalIf",
 	ErrWitnessPubKeyType:                  "ErrWitnessPubKeyType",
 	ErrDiscourageUpgradableWitnessProgram: "ErrDiscourageUpgradableWitnessProgram",
+	ErrUnsupportedScriptVersion:           "ErrUnsupportedScriptVersion",
 }
 
 // String returns the ErrorCode as a human-readable name.

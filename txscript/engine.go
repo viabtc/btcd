@@ -1002,3 +1002,24 @@ func NewEngine(scriptPubKey []byte, tx *wire.MsgTx, txIdx int, flags ScriptFlags
 
 	return &vm, nil
 }
+
+// isStrictPubKeyEncoding returns whether or not the passed public key adheres
+// to the strict encoding requirements.
+func isStrictPubKeyEncoding(pubKey []byte) bool {
+	if len(pubKey) == 33 && (pubKey[0] == 0x02 || pubKey[0] == 0x03) {
+		// Compressed
+		return true
+	}
+	if len(pubKey) == 65 {
+		switch pubKey[0] {
+		case 0x04:
+			// Uncompressed
+			return true
+
+		case 0x06, 0x07:
+			// Hybrid
+			return true
+		}
+	}
+	return false
+}

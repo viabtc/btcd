@@ -7,9 +7,11 @@ package txscript
 import (
 	"fmt"
 
+	"github.com/btcsuite/btcutil"
+
+	internalutil "github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/btcsuite/btcutil"
 )
 
 const (
@@ -58,6 +60,7 @@ const (
 	WitnessV0ScriptHashTy                    // Pay to witness script hash.
 	MultiSigTy                               // Multi signature.
 	NullDataTy                               // Empty data-only (provably prunable).
+	WitnessV1TaprootTy                       // Taproot output
 	WitnessUnknownTy                         // Witness unknown
 )
 
@@ -72,7 +75,16 @@ var scriptClassToName = []string{
 	WitnessV0ScriptHashTy: "witness_v0_scripthash",
 	MultiSigTy:            "multisig",
 	NullDataTy:            "nulldata",
+	WitnessV1TaprootTy:    "witness_v1_taproot",
 	WitnessUnknownTy:      "witness_unknown",
+}
+
+// multiSigDetails houses details extracted from a standard multisig script.
+type multiSigDetails struct {
+	requiredSigs int
+	numPubKeys   int
+	pubKeys      [][]byte
+	valid        bool
 }
 
 // String implements the Stringer interface by returning the name of
@@ -535,111 +547,218 @@ func PushedData(script []byte) ([][]byte, error) {
 	return data, nil
 }
 
+// extractMultisigScriptDetails attempts to extract details from the passed
+// script if it is a standard multisig script.  The returned details struct will
+// have the valid flag set to false otherwise.
+//
+// The extract pubkeys flag indicates whether or not the pubkeys themselves
+// should also be extracted and is provided because extracting them results in
+// an allocation that the caller might wish to avoid.  The pubKeys member of
+// the returned details struct will be nil when the flag is false.
+//
+// NOTE: This function is only valid for version 0 scripts.  The returned
+// details struct will always be empty and have the valid flag set to false for
+// other script versions.
+func extractMultisigScriptDetails(scriptVersion uint16, script []byte, extractPubKeys bool) multiSigDetails {
+	// The only currently supported script version is 0.
+	if scriptVersion != 0 {
+		return multiSigDetails{}
+	}
+
+	// A multi-signature script is of the form:
+	//  NUM_SIGS PUBKEY PUBKEY PUBKEY ... NUM_PUBKEYS OP_CHECKMULTISIG
+
+	// The script can't possibly be a multisig script if it doesn't end with
+	// OP_CHECKMULTISIG or have at least two small integer pushes preceding it.
+	// Fail fast to avoid more work below.
+	if len(script) < 3 || script[len(script)-1] != OP_CHECKMULTISIG {
+		return multiSigDetails{}
+	}
+
+	// The first opcode must be a small integer specifying the number of
+	// signatures required.
+	tokenizer := MakeScriptTokenizer(scriptVersion, script)
+	if !tokenizer.Next() || !IsSmallInt(tokenizer.Opcode()) {
+		return multiSigDetails{}
+	}
+	requiredSigs := AsSmallInt(tokenizer.Opcode())
+
+	// The next series of opcodes must either push public keys or be a small
+	// integer specifying the number of public keys.
+	var numPubKeys int
+	var pubKeys [][]byte
+	if extractPubKeys {
+		pubKeys = make([][]byte, 0, MaxPubKeysPerMultiSig)
+	}
+	for tokenizer.Next() {
+		if IsSmallInt(tokenizer.Opcode()) {
+			break
+		}
+
+		data := tokenizer.Data()
+		numPubKeys++
+		if !isStrictPubKeyEncoding(data) {
+			continue
+		}
+		if extractPubKeys {
+			pubKeys = append(pubKeys, data)
+		}
+	}
+	if tokenizer.Done() {
+		return multiSigDetails{}
+	}
+
+	// The next opcode must be a small integer specifying the number of public
+	// keys required.
+	op := tokenizer.Opcode()
+	if !IsSmallInt(op) || AsSmallInt(op) != numPubKeys {
+		return multiSigDetails{}
+	}
+
+	// There must only be a single opcode left unparsed which will be
+	// OP_CHECKMULTISIG per the check above.
+	if int32(len(tokenizer.Script()))-tokenizer.ByteIndex() != 1 {
+		return multiSigDetails{}
+	}
+
+	return multiSigDetails{
+		requiredSigs: requiredSigs,
+		numPubKeys:   numPubKeys,
+		pubKeys:      pubKeys,
+		valid:        true,
+	}
+}
+
+
+// extractPubKey extracts either compressed or uncompressed public key from the
+// passed script if it is a either a standard pay-to-compressed-secp256k1-pubkey
+// or pay-to-uncompressed-secp256k1-pubkey script, respectively.  It will return
+// nil otherwise.
+func extractPubKey(script []byte) []byte {
+	if pubKey := extractCompressedPubKey(script); pubKey != nil {
+		return pubKey
+	}
+	return extractUncompressedPubKey(script)
+}
+
+// extractCompressedPubKey extracts a compressed public key from the passed
+// script if it is a standard pay-to-compressed-secp256k1-pubkey script.  It
+// will return nil otherwise.
+func extractCompressedPubKey(script []byte) []byte {
+	// A pay-to-compressed-pubkey script is of the form:
+	//  OP_DATA_33 <33-byte compressed pubkey> OP_CHECKSIG
+
+	// All compressed secp256k1 public keys must start with 0x02 or 0x03.
+	if len(script) == 35 &&
+		script[34] == OP_CHECKSIG &&
+		script[0] == OP_DATA_33 &&
+		(script[1] == 0x02 || script[1] == 0x03) {
+
+		return script[1:34]
+	}
+
+	return nil
+}
+
+// extractUncompressedPubKey extracts an uncompressed public key from the
+// passed script if it is a standard pay-to-uncompressed-secp256k1-pubkey
+// script.  It will return nil otherwise.
+func extractUncompressedPubKey(script []byte) []byte {
+	// A pay-to-uncompressed-pubkey script is of the form:
+	//   OP_DATA_65 <65-byte uncompressed pubkey> OP_CHECKSIG
+	//
+	// All non-hybrid uncompressed secp256k1 public keys must start with 0x04.
+	// Hybrid uncompressed secp256k1 public keys start with 0x06 or 0x07:
+	//   - 0x06 => hybrid format for even Y coords
+	//   - 0x07 => hybrid format for odd Y coords
+	if len(script) == 67 &&
+		script[66] == OP_CHECKSIG &&
+		script[0] == OP_DATA_65 &&
+		(script[1] == 0x04 || script[1] == 0x06 || script[1] == 0x07) {
+
+		return script[1:66]
+	}
+	return nil
+}
+
 // ExtractPkScriptAddrs returns the type of script, addresses and required
 // signatures associated with the passed PkScript.  Note that it only works for
 // 'standard' transaction script types.  Any data such as public keys which are
 // invalid are omitted from the results.
-func ExtractPkScriptAddrs(pkScript []byte, chainParams *chaincfg.Params) (ScriptClass, []btcutil.Address, int, error) {
-	var addrs []btcutil.Address
-	var requiredSigs int
-
-	// No valid addresses or required signatures if the script doesn't
-	// parse.
-	pops, err := parseScript(pkScript)
-	if err != nil {
-		return NonStandardTy, nil, 0, err
+func ExtractPkScriptAddrs(
+	pkScript []byte,
+	chainParams *chaincfg.Params,
+) (ScriptClass, []btcutil.Address, int, error) {
+	// Check for pay-to-pubkey-hash script.
+	if hash := extractPubKeyHash(pkScript); hash != nil {
+		return PubKeyHashTy, pubKeyHashToAddrs(hash, chainParams), 1, nil
 	}
 
-	scriptClass := typeOfScript(pops)
-	switch scriptClass {
-	case PubKeyHashTy:
-		// A pay-to-pubkey-hash script is of the form:
-		//  OP_DUP OP_HASH160 <hash> OP_EQUALVERIFY OP_CHECKSIG
-		// Therefore the pubkey hash is the 3rd item on the stack.
-		// Skip the pubkey hash if it's invalid for some reason.
-		requiredSigs = 1
-		addr, err := btcutil.NewAddressPubKeyHash(pops[2].data,
-			chainParams)
+	// Check for pay-to-script-hash.
+	if hash := extractScriptHash(pkScript); hash != nil {
+		return ScriptHashTy, scriptHashToAddrs(hash, chainParams), 1, nil
+	}
+
+	// Check for pay-to-pubkey script.
+	if data := extractPubKey(pkScript); data != nil {
+		var addrs []btcutil.Address
+		addr, err := btcutil.NewAddressPubKey(data, chainParams)
 		if err == nil {
 			addrs = append(addrs, addr)
 		}
+		return PubKeyTy, addrs, 1, nil
+	}
 
-	case WitnessV0PubKeyHashTy:
-		// A pay-to-witness-pubkey-hash script is of thw form:
-		//  OP_0 <20-byte hash>
-		// Therefore, the pubkey hash is the second item on the stack.
-		// Skip the pubkey hash if it's invalid for some reason.
-		requiredSigs = 1
-		addr, err := btcutil.NewAddressWitnessPubKeyHash(pops[1].data,
-			chainParams)
-		if err == nil {
-			addrs = append(addrs, addr)
-		}
-
-	case PubKeyTy:
-		// A pay-to-pubkey script is of the form:
-		//  <pubkey> OP_CHECKSIG
-		// Therefore the pubkey is the first item on the stack.
-		// Skip the pubkey if it's invalid for some reason.
-		requiredSigs = 1
-		addr, err := btcutil.NewAddressPubKey(pops[0].data, chainParams)
-		if err == nil {
-			addrs = append(addrs, addr)
-		}
-
-	case ScriptHashTy:
-		// A pay-to-script-hash script is of the form:
-		//  OP_HASH160 <scripthash> OP_EQUAL
-		// Therefore the script hash is the 2nd item on the stack.
-		// Skip the script hash if it's invalid for some reason.
-		requiredSigs = 1
-		addr, err := btcutil.NewAddressScriptHashFromHash(pops[1].data,
-			chainParams)
-		if err == nil {
-			addrs = append(addrs, addr)
-		}
-
-	case WitnessV0ScriptHashTy:
-		// A pay-to-witness-script-hash script is of the form:
-		//  OP_0 <32-byte hash>
-		// Therefore, the script hash is the second item on the stack.
-		// Skip the script hash if it's invalid for some reason.
-		requiredSigs = 1
-		addr, err := btcutil.NewAddressWitnessScriptHash(pops[1].data,
-			chainParams)
-		if err == nil {
-			addrs = append(addrs, addr)
-		}
-
-	case MultiSigTy:
-		// A multi-signature script is of the form:
-		//  <numsigs> <pubkey> <pubkey> <pubkey>... <numpubkeys> OP_CHECKMULTISIG
-		// Therefore the number of required signatures is the 1st item
-		// on the stack and the number of public keys is the 2nd to last
-		// item on the stack.
-		requiredSigs = asSmallInt(pops[0].opcode)
-		numPubKeys := asSmallInt(pops[len(pops)-2].opcode)
-
-		// Extract the public keys while skipping any that are invalid.
-		addrs = make([]btcutil.Address, 0, numPubKeys)
-		for i := 0; i < numPubKeys; i++ {
-			addr, err := btcutil.NewAddressPubKey(pops[i+1].data,
-				chainParams)
+	// Check for multi-signature script.
+	const scriptVersion = 0
+	details := extractMultisigScriptDetails(scriptVersion, pkScript, true)
+	if details.valid {
+		// Convert the public keys while skipping any that are invalid.
+		addrs := make([]btcutil.Address, 0, len(details.pubKeys))
+		for _, pubkey := range details.pubKeys {
+			addr, err := btcutil.NewAddressPubKey(pubkey, chainParams)
 			if err == nil {
 				addrs = append(addrs, addr)
 			}
 		}
-
-	case NullDataTy:
-		// Null data transactions have no addresses or required
-		// signatures.
-
-	case NonStandardTy:
-		// Don't attempt to extract addresses or required signatures for
-		// nonstandard transactions.
+		return MultiSigTy, addrs, details.requiredSigs, nil
 	}
 
-	return scriptClass, addrs, requiredSigs, nil
+	// Check for null data script.
+	if isNullDataScript(scriptVersion, pkScript) {
+		// Null data transactions have no addresses or required signatures.
+		return NullDataTy, nil, 0, nil
+	}
+
+	if hash := extractWitnessPubKeyHash(pkScript); hash != nil {
+		var addrs []btcutil.Address
+		addr, err := btcutil.NewAddressWitnessPubKeyHash(hash, chainParams)
+		if err == nil {
+			addrs = append(addrs, addr)
+		}
+		return WitnessV0PubKeyHashTy, addrs, 1, nil
+	}
+
+	if hash := extractWitnessV0ScriptHash(pkScript); hash != nil {
+		var addrs []btcutil.Address
+		addr, err := btcutil.NewAddressWitnessScriptHash(hash, chainParams)
+		if err == nil {
+			addrs = append(addrs, addr)
+		}
+		return WitnessV0ScriptHashTy, addrs, 1, nil
+	}
+
+	if rawKey := extractWitnessV1KeyBytes(pkScript); rawKey != nil {
+		var addrs []btcutil.Address
+		addr, err := internalutil.NewAddressTaproot(rawKey, chainParams)
+		if err == nil {
+			addrs = append(addrs, addr)
+		}
+		return WitnessV1TaprootTy, addrs, 1, nil
+	}
+
+	// If none of the above passed, then the address must be non-standard.
+	return NonStandardTy, nil, 0, nil
 }
 
 // AtomicSwapDataPushes houses the data pushes found in atomic swap contracts.
@@ -722,4 +841,150 @@ func ExtractAtomicSwapDataPushes(version uint16, pkScript []byte) (*AtomicSwapDa
 		return nil, nil
 	}
 	return pushes, nil
+}
+
+// extractPubKeyHash extracts the public key hash from the passed script if it
+// is a standard pay-to-pubkey-hash script.  It will return nil otherwise.
+func extractPubKeyHash(script []byte) []byte {
+	// A pay-to-pubkey-hash script is of the form:
+	//  OP_DUP OP_HASH160 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG
+	if len(script) == 25 &&
+		script[0] == OP_DUP &&
+		script[1] == OP_HASH160 &&
+		script[2] == OP_DATA_20 &&
+		script[23] == OP_EQUALVERIFY &&
+		script[24] == OP_CHECKSIG {
+
+		return script[3:23]
+	}
+
+	return nil
+}
+
+// pubKeyHashToAddrs is a convenience function to attempt to convert the
+// passed hash to a pay-to-pubkey-hash address housed within an address
+// slice.  It is used to consolidate common code.
+func pubKeyHashToAddrs(hash []byte, params *chaincfg.Params) []btcutil.Address {
+	// Skip the pubkey hash if it's invalid for some reason.
+	var addrs []btcutil.Address
+	addr, err := btcutil.NewAddressPubKeyHash(hash, params)
+	if err == nil {
+		addrs = append(addrs, addr)
+	}
+	return addrs
+}
+
+// scriptHashToAddrs is a convenience function to attempt to convert the passed
+// hash to a pay-to-script-hash address housed within an address slice.  It is
+// used to consolidate common code.
+func scriptHashToAddrs(hash []byte, params *chaincfg.Params) []btcutil.Address {
+	// Skip the hash if it's invalid for some reason.
+	var addrs []btcutil.Address
+	addr, err := btcutil.NewAddressScriptHashFromHash(hash, params)
+	if err == nil {
+		addrs = append(addrs, addr)
+	}
+	return addrs
+}
+
+// extractScriptHash extracts the script hash from the passed script if it is a
+// standard pay-to-script-hash script.  It will return nil otherwise.
+//
+// NOTE: This function is only valid for version 0 opcodes.  Since the function
+// does not accept a script version, the results are undefined for other script
+// versions.
+func extractScriptHash(script []byte) []byte {
+	// A pay-to-script-hash script is of the form:
+	//  OP_HASH160 <20-byte scripthash> OP_EQUAL
+	if len(script) == 23 &&
+		script[0] == OP_HASH160 &&
+		script[1] == OP_DATA_20 &&
+		script[22] == OP_EQUAL {
+
+		return script[2:22]
+	}
+
+	return nil
+}
+
+// isNullDataScript returns whether or not the passed script is a standard
+// null data script.
+//
+// NOTE: This function is only valid for version 0 scripts.  It will always
+// return false for other script versions.
+func isNullDataScript(scriptVersion uint16, script []byte) bool {
+	// The only currently supported script version is 0.
+	if scriptVersion != 0 {
+		return false
+	}
+
+	// A null script is of the form:
+	//  OP_RETURN <optional data>
+	//
+	// Thus, it can either be a single OP_RETURN or an OP_RETURN followed by a
+	// data push up to MaxDataCarrierSize bytes.
+
+	// The script can't possibly be a null data script if it doesn't start
+	// with OP_RETURN.  Fail fast to avoid more work below.
+	if len(script) < 1 || script[0] != OP_RETURN {
+		return false
+	}
+
+	// Single OP_RETURN.
+	if len(script) == 1 {
+		return true
+	}
+
+	// OP_RETURN followed by data push up to MaxDataCarrierSize bytes.
+	tokenizer := MakeScriptTokenizer(scriptVersion, script[1:])
+	return tokenizer.Next() && tokenizer.Done() &&
+		(IsSmallInt(tokenizer.Opcode()) || tokenizer.Opcode() <= OP_PUSHDATA4) &&
+		len(tokenizer.Data()) <= MaxDataCarrierSize
+}
+
+// extractWitnessPubKeyHash extracts the witness public key hash from the passed
+// script if it is a standard pay-to-witness-pubkey-hash script. It will return
+// nil otherwise.
+func extractWitnessPubKeyHash(script []byte) []byte {
+	// A pay-to-witness-pubkey-hash script is of the form:
+	//   OP_0 OP_DATA_20 <20-byte-hash>
+	if len(script) == witnessV0PubKeyHashLen &&
+		script[0] == OP_0 &&
+		script[1] == OP_DATA_20 {
+
+		return script[2:witnessV0PubKeyHashLen]
+	}
+
+	return nil
+}
+
+// extractWitnessV0ScriptHash extracts the witness script hash from the passed
+// script if it is standard pay-to-witness-script-hash script. It will return
+// nil otherwise.
+func extractWitnessV0ScriptHash(script []byte) []byte {
+	// A pay-to-witness-script-hash script is of the form:
+	//   OP_0 OP_DATA_32 <32-byte-hash>
+	if len(script) == witnessV0ScriptHashLen &&
+		script[0] == OP_0 &&
+		script[1] == OP_DATA_32 {
+
+		return script[2:34]
+	}
+
+	return nil
+}
+
+// extractWitnessV1KeyBytes extracts the raw public key bytes script if it is
+// standard pay-to-witness-script-hash v1 script. It will return nil otherwise.
+func extractWitnessV1KeyBytes(script []byte) []byte {
+	// A pay-to-witness-script-hash script is of the form:
+	//   OP_1 OP_DATA_32 <32-byte-hash>
+	if len(script) == witnessV1TaprootLen &&
+		script[0] == OP_1 &&
+		script[1] == OP_DATA_32 {
+
+		return script[2:34]
+	}
+
+	return nil
 }

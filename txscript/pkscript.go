@@ -5,11 +5,12 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/btcsuite/btcutil"
+	"golang.org/x/crypto/ripemd160"
+
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/btcsuite/btcutil"
-	"golang.org/x/crypto/ripemd160"
 )
 
 const (
@@ -49,6 +50,9 @@ const (
 
 	// maxLen is the maximum script length supported by ParsePkScript.
 	maxLen = witnessV0ScriptHashLen
+
+	// witnessV1TaprootLen is the length of a P2TR script.
+	witnessV1TaprootLen = 34
 )
 
 var (
